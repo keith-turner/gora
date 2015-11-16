@@ -45,32 +45,24 @@ import org.apache.accumulo.core.client.IteratorSetting;
 import org.apache.accumulo.core.client.MutationsRejectedException;
 import org.apache.accumulo.core.client.RowIterator;
 import org.apache.accumulo.core.client.Scanner;
-import org.apache.accumulo.core.client.TableDeletedException;
 import org.apache.accumulo.core.client.TableExistsException;
 import org.apache.accumulo.core.client.TableNotFoundException;
-import org.apache.accumulo.core.client.TableOfflineException;
 import org.apache.accumulo.core.client.ZooKeeperInstance;
-import org.apache.accumulo.core.client.impl.Tables;
-import org.apache.accumulo.core.client.impl.TabletLocator;
-import org.apache.accumulo.core.client.mock.MockConnector;
+import org.apache.accumulo.core.client.admin.Locations;
 import org.apache.accumulo.core.client.mock.MockInstance;
-import org.apache.accumulo.core.client.mock.MockTabletLocator;
 import org.apache.accumulo.core.client.security.tokens.AuthenticationToken;
 import org.apache.accumulo.core.client.security.tokens.PasswordToken;
 import org.apache.accumulo.core.data.ByteSequence;
 import org.apache.accumulo.core.data.Key;
-import org.apache.accumulo.core.data.KeyExtent;
 import org.apache.accumulo.core.data.Mutation;
 import org.apache.accumulo.core.data.Range;
+import org.apache.accumulo.core.data.TabletId;
 import org.apache.accumulo.core.data.Value;
 import org.apache.accumulo.core.iterators.SortedKeyIterator;
 import org.apache.accumulo.core.iterators.user.TimestampFilter;
-import org.apache.accumulo.core.master.state.tables.TableState;
 import org.apache.accumulo.core.security.Authorizations;
 import org.apache.accumulo.core.security.ColumnVisibility;
-import org.apache.accumulo.core.security.Credentials;
 import org.apache.accumulo.core.util.Pair;
-import org.apache.accumulo.core.util.UtilWaitThread;
 import org.apache.avro.Schema;
 import org.apache.avro.Schema.Field;
 import org.apache.avro.Schema.Type;
@@ -119,7 +111,6 @@ public class AccumuloStore<K,T extends PersistentBase> extends DataStoreBase<K,T
   private Connector conn;
   private BatchWriter batchWriter;
   private AccumuloMapping mapping;
-  private Credentials credentials;
   private Encoder encoder;
 
   public static final Logger LOG = LoggerFactory.getLogger(AccumuloStore.class);
@@ -368,9 +359,9 @@ public class AccumuloStore<K,T extends PersistentBase> extends DataStoreBase<K,T
           String zookeepers = DataStoreFactory.findProperty(properties, this, ZOOKEEPERS_NAME_PROPERTY, null);
           conn = new ZooKeeperInstance(instance, zookeepers).getConnector(user, token);
         } else {
+          LOG.warn("MockAccumulo is deprecated!");
           conn = new MockInstance().getConnector(user, token);
         }
-        credentials = new Credentials(user, token);
 
         if (autoCreateSchema && !schemaExists())
           createSchema();
@@ -876,24 +867,8 @@ public class AccumuloStore<K,T extends PersistentBase> extends DataStoreBase<K,T
   @Override
   public List<PartitionQuery<K,T>> getPartitions(Query<K,T> query) throws IOException {
     try {
-      TabletLocator tl;
-      if (conn instanceof MockConnector)
-        tl = new MockTabletLocator();
-      else
-        tl = TabletLocator.getLocator(conn.getInstance(), new Text(Tables.getTableId(conn.getInstance(), mapping.tableName)));
 
-      Map<String,Map<KeyExtent,List<Range>>> binnedRanges = new HashMap<>();
-
-      tl.invalidateCache();
-      while (tl.binRanges(credentials, Collections.singletonList(createRange(query)), binnedRanges).size() > 0) {
-        // TODO log?
-        if (!Tables.exists(conn.getInstance(), Tables.getTableId(conn.getInstance(), mapping.tableName)))
-          throw new TableDeletedException(Tables.getTableId(conn.getInstance(), mapping.tableName));
-        else if (Tables.getTableState(conn.getInstance(), Tables.getTableId(conn.getInstance(), mapping.tableName)) == TableState.OFFLINE)
-          throw new TableOfflineException(conn.getInstance(), Tables.getTableId(conn.getInstance(), mapping.tableName));
-        UtilWaitThread.sleep(100);
-        tl.invalidateCache();
-      }
+      Locations locations = conn.tableOperations().locate(mapping.tableName, Collections.singletonList(createRange(query)));
 
       List<PartitionQuery<K,T>> ret = new ArrayList<>();
 
@@ -907,8 +882,25 @@ public class AccumuloStore<K,T extends PersistentBase> extends DataStoreBase<K,T
       //hadoop expects hostnames, accumulo keeps track of IPs... so need to convert
       HashMap<String,String> hostNameCache = new HashMap<>();
 
-      for (Entry<String,Map<KeyExtent,List<Range>>> entry : binnedRanges.entrySet()) {
-        String ip = entry.getKey().split(":", 2)[0];
+      for(TabletId ke : locations.groupByTablet().keySet()) {
+        K startKey = null;
+        if (startRow == null || !ke.toRange().contains(new Key(startRow))) {
+          if (ke.getPrevEndRow() != null) {
+            startKey = followingKey(encoder, getKeyClass(), getBytes(ke.getPrevEndRow()));
+          }
+        } else {
+          startKey = fromBytes(getKeyClass(), getBytes(startRow));
+        }
+
+        K endKey = null;
+        if (endRow == null || !ke.toRange().contains(new Key(endRow))) {
+          if (ke.getEndRow() != null)
+            endKey = lastPossibleKey(encoder, getKeyClass(), getBytes(ke.getEndRow()));
+        } else {
+          endKey = fromBytes(getKeyClass(), getBytes(endRow));
+        }
+
+        String ip = locations.getTabletLocation(ke).split(":", 2)[0];
         String location = hostNameCache.get(ip);
         if (location == null) {
           InetAddress inetAddress = InetAddress.getByName(ip);
@@ -916,30 +908,9 @@ public class AccumuloStore<K,T extends PersistentBase> extends DataStoreBase<K,T
           hostNameCache.put(ip, location);
         }
 
-        Map<KeyExtent,List<Range>> tablets = entry.getValue();
-        for (KeyExtent ke : tablets.keySet()) {
-
-          K startKey = null;
-          if (startRow == null || !ke.contains(startRow)) {
-            if (ke.getPrevEndRow() != null) {
-              startKey = followingKey(encoder, getKeyClass(), getBytes(ke.getPrevEndRow()));
-            }
-          } else {
-            startKey = fromBytes(getKeyClass(), getBytes(startRow));
-          }
-
-          K endKey = null;
-          if (endRow == null || !ke.contains(endRow)) {
-            if (ke.getEndRow() != null)
-              endKey = lastPossibleKey(encoder, getKeyClass(), getBytes(ke.getEndRow()));
-          } else {
-            endKey = fromBytes(getKeyClass(), getBytes(endRow));
-          }
-
-          PartitionQueryImpl<K, T> pqi = new PartitionQueryImpl<>(query, startKey, endKey, location);
-          pqi.setConf(getConf());
-          ret.add(pqi);
-        }
+        PartitionQueryImpl<K, T> pqi = new PartitionQueryImpl<>(query, startKey, endKey, location);
+        pqi.setConf(getConf());
+        ret.add(pqi);
       }
 
       return ret;
